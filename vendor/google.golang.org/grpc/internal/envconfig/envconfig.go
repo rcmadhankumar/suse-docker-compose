@@ -55,6 +55,13 @@ var (
 	// setting the environment variable "GRPC_EXPERIMENTAL_ENABLE_NEW_PICK_FIRST"
 	// to "true".
 	NewPickFirstEnabled = boolFromEnv("GRPC_EXPERIMENTAL_ENABLE_NEW_PICK_FIRST", false)
+	// EnableReceiveBufferCompaction enables the compaction of data buffers
+	// to reduce the number of buffers in the receive buffer.
+	//
+	// This environment variable serves as an escape hatch to disable the
+	// feature if unforeseen issues arise, and it will be removed in a future
+	// release.
+	EnableReceiveBufferCompaction = boolFromEnv("GRPC_GO_EXPERIMENTAL_ENABLE_RECEIVE_BUFFER_COMPACTION", true)
 )
 
 func boolFromEnv(envVar string, def bool) bool {

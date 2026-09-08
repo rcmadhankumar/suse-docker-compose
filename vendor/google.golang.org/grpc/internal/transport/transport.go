@@ -30,10 +30,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/internal/channelz"
+	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
@@ -43,7 +45,35 @@ import (
 	"google.golang.org/grpc/tap"
 )
 
-const logLevel = 2
+const (
+	logLevel = 2
+	// recvMsgSize estimates the memory overhead of a recvMsg in the backlog.
+	// It accounts for the recvMsg struct itself and the slice header of the
+	// underlying buffer's data.
+	recvMsgSize = int(unsafe.Sizeof(recvMsg{}) + unsafe.Sizeof([]byte{}))
+
+	// utilizationFactor controls when we consider memory utilization acceptable.
+	// When backlogHeapSize / payloadSize <= utilizationFactor (meaning at least
+	// 50% of the heap memory is actual payload data), compaction is skipped.
+	utilizationFactor = 2
+
+	// bufferPoolingThreshold mirrors mem.bufferPoolingThreshold /
+	// internal/mem.BufferPoolingThreshold in newer grpc-go releases (both
+	// 1<<10 at the time of writing); this vendored version predates the
+	// internal/mem package that later exported it, so the value is inlined
+	// here instead of imported.
+	bufferPoolingThreshold = 1 << 10
+)
+
+// compactionThreshold is approx 57KB (on 64-bit systems). It allows
+// accumulating up to 1024 1-byte payloads before triggering compaction.
+//
+// Because individual payloads <= 1024 bytes are allocated on the heap
+// outside mem.BufferPool, waiting for at least 1024 bytes to accumulate
+// ensures that compaction coalesces those small heap allocations into a
+// single large buffer from mem.BufferPool, enabling buffer reuse while
+// avoiding frequent copying for small bursts of frames.
+var compactionThreshold = bufferPoolingThreshold * (recvMsgSize + 1)
 
 // recvMsg represents the received msg from the transport. All transport
 // protocol specific info has been removed.
@@ -65,7 +95,13 @@ type recvBuffer struct {
 	c       chan recvMsg
 	mu      sync.Mutex
 	backlog []recvMsg
-	err     error
+	// uncompactedSuffixLen tracks the number of consecutive data messages at
+	// the tail of backlog that have not been compacted.
+	uncompactedSuffixLen int
+	// uncompactedBytes tracks the total payload bytes across the trailing
+	// uncompactedSuffixLen messages.
+	uncompactedBytes int
+	err              error
 }
 
 func newRecvBuffer() *recvBuffer {
@@ -77,11 +113,11 @@ func newRecvBuffer() *recvBuffer {
 
 func (b *recvBuffer) put(r recvMsg) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.err != nil {
 		// drop the buffer on the floor. Since b.err is not nil, any subsequent reads
 		// will always return an error, making this buffer inaccessible.
 		r.buffer.Free()
-		b.mu.Unlock()
 		// An error had occurred earlier, don't accept more
 		// data or errors.
 		return
@@ -90,13 +126,80 @@ func (b *recvBuffer) put(r recvMsg) {
 	if len(b.backlog) == 0 {
 		select {
 		case b.c <- r:
-			b.mu.Unlock()
 			return
 		default:
 		}
 	}
 	b.backlog = append(b.backlog, r)
-	b.mu.Unlock()
+	b.compactBacklogLocked(r)
+}
+
+// compactBacklogLocked coalesces a trailing run of small, individually
+// heap-allocated recvMsg payloads into a single larger buffer drawn from
+// mem.DefaultBufferPool once the per-message tracking overhead (recvMsgSize
+// per entry) becomes large relative to the actual payload bytes buffered.
+// This bounds the memory amplification a peer can cause by fragmenting a
+// stream's payload into many tiny (e.g. 1-byte) HTTP/2 DATA frames.
+//
+// mem.DefaultBufferPool() is used here rather than a transport-specific
+// pool (as upstream grpc-go threads through recvBuffer.init/newRecvBuffer)
+// to avoid changing recvBuffer's construction signature and its call sites
+// in handler_server.go/http2_client.go/http2_server.go. A compacted
+// buffer's pool is fixed at creation via mem.NewBuffer, so this is
+// self-consistent (Get and the eventual Put always go through the same
+// pool) even if a transport was configured with a custom BufferPool via
+// grpc.WithBufferPool; the only effect is that compacted buffers in that
+// case reuse the default pool instead of the custom one.
+func (b *recvBuffer) compactBacklogLocked(r recvMsg) {
+	if !envconfig.EnableReceiveBufferCompaction {
+		return
+	}
+	if r.buffer == nil {
+		b.uncompactedBytes = 0
+		b.uncompactedSuffixLen = 0
+		return
+	}
+
+	b.uncompactedSuffixLen++
+	b.uncompactedBytes += r.buffer.Len()
+	backlogHeapSize := b.uncompactedSuffixLen*recvMsgSize + b.uncompactedBytes
+
+	// If the memory overhead is less than 50% of the heap usage (e.g., because
+	// a large DATA frame arrived), the average message size in the suffix is
+	// large enough that memory bloat is not a concern. Reset suffix tracking.
+	if backlogHeapSize <= utilizationFactor*b.uncompactedBytes {
+		b.uncompactedBytes = 0
+		b.uncompactedSuffixLen = 0
+		return
+	}
+	// Avoid compacting too frequently for short bursts of small frames.
+	// Wait until we have accumulated at least ~1024 small messages (~57 KB).
+	if backlogHeapSize <= compactionThreshold {
+		// Still can accumulate more payloads.
+		return
+	}
+
+	pool := mem.DefaultBufferPool()
+	start := 0
+	newBuf := pool.Get(b.uncompactedBytes)
+	startIdx := len(b.backlog) - b.uncompactedSuffixLen
+
+	for i := startIdx; i < len(b.backlog); i++ {
+		m := b.backlog[i]
+		b.backlog[i] = recvMsg{}
+		start += copy((*newBuf)[start:], m.buffer.ReadOnlyData())
+		m.buffer.Free()
+	}
+	b.backlog[startIdx] = recvMsg{
+		buffer: mem.NewBuffer(newBuf, pool),
+	}
+	b.backlog = b.backlog[:startIdx+1]
+	// After compaction, the suffix is replaced with a single message containing
+	// the combined payload. The new utilization is close to 1.0 (overhead of
+	// one recvMsg relative to the large compacted payload), which is well
+	// below the utilization factor of 2.
+	b.uncompactedBytes = 0
+	b.uncompactedSuffixLen = 0
 }
 
 func (b *recvBuffer) load() {
@@ -104,6 +207,13 @@ func (b *recvBuffer) load() {
 	if len(b.backlog) > 0 {
 		select {
 		case b.c <- b.backlog[0]:
+			// backlog[0] is only part of the tracked uncompacted suffix if the
+			// entire backlog currently consists of the suffix. If an earlier
+			// compaction or reset occurred, backlog[0] is already compacted.
+			if envconfig.EnableReceiveBufferCompaction && b.uncompactedSuffixLen == len(b.backlog) {
+				b.uncompactedSuffixLen--
+				b.uncompactedBytes -= b.backlog[0].buffer.Len()
+			}
 			b.backlog[0] = recvMsg{}
 			b.backlog = b.backlog[1:]
 		default:
